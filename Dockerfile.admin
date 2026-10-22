@@ -1,0 +1,47 @@
+# TrueSpotter admin (Rust) — production image (multi-stage, static musl → scratch).
+# Build context: repo root (`docker build -f Dockerfile.admin .`).
+# Spec: read-only admin surface for the RN app (AdminService.ts): admin
+# login (JWT), chat sessions, products (OpenSearch), web reviews, stats,
+# Temporal workflows (SQL visibility). PORT 8089.
+FROM rust:1-slim AS build
+WORKDIR /src
+
+# musl toolchain for a fully static binary (scratch final stage).
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add x86_64-unknown-linux-musl
+
+# Layer-cacheable dependency build: manifest + lock + dummy sources first,
+# so source edits never invalidate the compiled-dependencies layer.
+COPY src/rust/truespotter-admin/Cargo.toml src/rust/truespotter-admin/Cargo.lock* ./
+RUN mkdir src && \
+    printf 'fn main() {}' > src/main.rs && \
+    cargo build --release --target x86_64-unknown-linux-musl && \
+    cargo clean --release --target x86_64-unknown-linux-musl -p truespotter-admin && \
+    rm -rf src
+
+# Real sources — only this layer rebuilds on code changes.
+COPY src/rust/truespotter-admin/src ./src
+RUN cargo build --release --target x86_64-unknown-linux-musl \
+    && mkdir -p /out \
+    && cp target/x86_64-unknown-linux-musl/release/truespotter-admin /out/
+
+# `scratch` needs the system CA bundle for outbound TLS (OpenSearch).
+RUN cp /etc/ssl/certs/ca-certificates.crt /out/
+
+FROM scratch AS final
+WORKDIR /app
+
+COPY --from=build /out/truespotter-admin ./
+COPY --from=build /out/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+ENV PORT=8089 \
+    RUST_LOG=info \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+EXPOSE 8089
+
+# No shell in scratch — the binary self-checks (--healthcheck mode in main.rs).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/app/truespotter-admin", "--healthcheck"]
+
+ENTRYPOINT ["/app/truespotter-admin"]
